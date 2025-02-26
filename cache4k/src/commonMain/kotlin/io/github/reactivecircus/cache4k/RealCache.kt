@@ -66,7 +66,7 @@ internal class RealCache<Key : Any, Value : Any>(
      */
     private val writeQueue: IsoMutableSet<CacheEntry<Key, Value>>? =
         takeIf { expiresAfterWrite }?.let {
-            ReorderingIsoMutableSet()
+            IsoMutableSet()
         }
 
     /**
@@ -78,6 +78,11 @@ internal class RealCache<Key : Any, Value : Any>(
      */
     private val accessQueue: IsoMutableSet<CacheEntry<Key, Value>>? =
         takeIf { expiresAfterAccess || evictsBySize }?.let {
+            ReorderingIsoMutableSet()
+        }
+
+    private val expiresAtQueue: IsoMutableSet<CacheEntry<Key, Value>>? =
+        takeIf { expiresAt != null }?.let {
             ReorderingIsoMutableSet()
         }
 
@@ -131,13 +136,20 @@ internal class RealCache<Key : Any, Value : Any>(
         } else {
             // create a new cache entry
             val nowTimeMark = timeSource.markNow()
+            val expiration = expiresAt?.invoke(key, value)
+
             val newEntry = CacheEntry(
                 key = key,
                 value = atomic(value),
                 accessTimeMark = atomic(nowTimeMark),
                 writeTimeMark = atomic(nowTimeMark),
-                expiresAt = expiresAt?.invoke(key, value)
+                expiresAt = expiration
             )
+
+            if (expiration != null) {
+                expiresAtQueue!!.add(newEntry)
+            }
+
             recordWrite(newEntry)
             cacheEntries.put(key, newEntry)
         }
@@ -155,6 +167,7 @@ internal class RealCache<Key : Any, Value : Any>(
         cacheEntries.remove(key)?.also {
             writeQueue?.remove(it)
             accessQueue?.remove(it)
+            expiresAtQueue?.remove(it)
             onEvent(
                 CacheEvent.Removed(
                     key = it.key,
@@ -178,6 +191,7 @@ internal class RealCache<Key : Any, Value : Any>(
         cacheEntries.clear()
         writeQueue?.clear()
         accessQueue?.clear()
+        expiresAtQueue?.clear()
     }
 
     override fun asMap(): Map<in Key, Value> {
@@ -190,10 +204,7 @@ internal class RealCache<Key : Any, Value : Any>(
      * Remove all expired entries.
      */
     private fun expireEntries() {
-        val queuesToProcess = listOfNotNull(
-            if (expiresAfterWrite) writeQueue else null,
-            if (expiresAfterAccess) accessQueue else null
-        )
+        val queuesToProcess = listOfNotNull(writeQueue, accessQueue, expiresAtQueue)
 
         queuesToProcess.forEach { queue ->
             queue.access {
@@ -261,8 +272,8 @@ internal class RealCache<Key : Any, Value : Any>(
         if (expiresAfterAccess) {
             val accessTimeMark = cacheEntry.accessTimeMark.value
             cacheEntry.accessTimeMark.update { accessTimeMark + accessTimeMark.elapsedNow() }
+            accessQueue?.add(cacheEntry)
         }
-        accessQueue?.add(cacheEntry)
     }
 
     /**
@@ -270,16 +281,13 @@ internal class RealCache<Key : Any, Value : Any>(
      * Note that a write is also considered an access.
      */
     private fun recordWrite(cacheEntry: CacheEntry<Key, Value>) {
-        if (expiresAfterAccess) {
-            val accessTimeMark = cacheEntry.accessTimeMark.value
-            cacheEntry.accessTimeMark.update { (accessTimeMark + accessTimeMark.elapsedNow()) }
-        }
+        recordRead(cacheEntry)
+
         if (expiresAfterWrite) {
             val writeTimeMark = cacheEntry.writeTimeMark.value
             cacheEntry.writeTimeMark.update { (writeTimeMark + writeTimeMark.elapsedNow()) }
+            writeQueue?.add(cacheEntry)
         }
-        accessQueue?.add(cacheEntry)
-        writeQueue?.add(cacheEntry)
     }
 
     private fun onEvent(event: CacheEvent<Key, Value>) {
